@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# Lambda build artifacts
+.build/
+
+# CDK
+cdk.out/
+
+# IDE
+.idea/
+.vscode/
+.kiro/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Linting
+.ruff_cache/
+
+# Testing
+.pytest_cache/
+.hypothesis/
+htmlcov/
+.coverage
+coverage.xml
+
+# Environment variables
+.env
+.env.local
+
+# Logs
+*.log
+
+# Holmes
+.holmes/

@@ -1,0 +1,372 @@
+{
+    "Comment": "IoT Firmware Deployment Orchestration Workflow",
+    "StartAt": "PlanDeployment",
+    "TimeoutSeconds": 14400,
+    "States": {
+        "PlanDeployment": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Parameters": {
+                "FunctionName": "${LambdaFunctionArn}",
+                "Payload": {
+                    "action": "PLAN",
+                    "firmware_s3_url.$": "$.firmware_s3_url",
+                    "target_version.$": "$.target_version",
+                    "device_type.$": "$.device_type"
+                }
+            },
+            "ResultPath": "$.plan_result",
+            "ResultSelector": {
+                "deployment_id.$": "$.Payload.deployment_id",
+                "wave_plan.$": "$.Payload.wave_plan",
+                "total_devices.$": "$.Payload.total_devices",
+                "status.$": "$.Payload.status"
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.TooManyRequestsException",
+                        "States.TaskFailed"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 2.0
+                }
+            ],
+            "Catch": [
+                {
+                    "ErrorEquals": [
+                        "States.ALL"
+                    ],
+                    "ResultPath": "$.error",
+                    "Next": "NotifyOperator"
+                }
+            ],
+            "Next": "NotifyDeploymentStarted"
+        },
+        "NotifyDeploymentStarted": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::sns:publish",
+            "Parameters": {
+                "TopicArn": "${NotificationTopicArn}",
+                "Subject": "Firmware Deployment Started",
+                "Message.$": "States.Format('Deployment {} started. Target version: {}. Total devices: {}', $.plan_result.deployment_id, $.target_version, $.plan_result.total_devices)"
+            },
+            "ResultPath": "$.notify_started_result",
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.TooManyRequestsException",
+                        "States.TaskFailed"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 2.0
+                }
+            ],
+            "Catch": [
+                {
+                    "ErrorEquals": [
+                        "States.ALL"
+                    ],
+                    "ResultPath": "$.error",
+                    "Next": "NotifyOperator"
+                }
+            ],
+            "Next": "ExecuteWaveIterator"
+        },
+        "ExecuteWaveIterator": {
+            "Type": "Map",
+            "ItemsPath": "$.plan_result.wave_plan",
+            "MaxConcurrency": 1,
+            "Parameters": {
+                "wave.$": "$$.Map.Item.Value",
+                "wave_index.$": "$$.Map.Item.Index",
+                "deployment_id.$": "$.plan_result.deployment_id",
+                "firmware_s3_url.$": "$.firmware_s3_url",
+                "target_version.$": "$.target_version"
+            },
+            "Iterator": {
+                "StartAt": "CreateIoTJob",
+                "States": {
+                    "CreateIoTJob": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "Parameters": {
+                            "FunctionName": "${LambdaFunctionArn}",
+                            "Payload": {
+                                "action": "CREATE_WAVE",
+                                "deployment_id.$": "$.deployment_id",
+                                "wave_number.$": "$.wave.wave_number",
+                                "thing_names.$": "$.wave.thing_names",
+                                "firmware_s3_url.$": "$.firmware_s3_url",
+                                "timeout_minutes": 30
+                            }
+                        },
+                        "ResultPath": "$.job_result",
+                        "ResultSelector": {
+                            "job_id.$": "$.Payload.job_id",
+                            "job_arn.$": "$.Payload.job_arn",
+                            "target_count.$": "$.Payload.target_count"
+                        },
+                        "Retry": [
+                            {
+                                "ErrorEquals": [
+                                    "Lambda.ServiceException",
+                                    "Lambda.TooManyRequestsException",
+                                    "States.TaskFailed"
+                                ],
+                                "IntervalSeconds": 2,
+                                "MaxAttempts": 2,
+                                "BackoffRate": 2.0
+                            }
+                        ],
+                        "Catch": [
+                            {
+                                "ErrorEquals": [
+                                    "States.ALL"
+                                ],
+                                "ResultPath": "$.error",
+                                "Next": "ExecuteRollback"
+                            }
+                        ],
+                        "Next": "WaitForWaveCompletion"
+                    },
+                    "WaitForWaveCompletion": {
+                        "Type": "Wait",
+                        "Seconds": 30,
+                        "Next": "CheckWaveStatus"
+                    },
+                    "CheckWaveStatus": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "Parameters": {
+                            "FunctionName": "${LambdaFunctionArn}",
+                            "Payload": {
+                                "action": "CHECK_WAVE_STATUS",
+                                "job_id.$": "$.job_result.job_id"
+                            }
+                        },
+                        "ResultPath": "$.status_result",
+                        "ResultSelector": {
+                            "is_complete.$": "$.Payload.is_complete",
+                            "summary.$": "$.Payload.summary"
+                        },
+                        "Retry": [
+                            {
+                                "ErrorEquals": [
+                                    "Lambda.ServiceException",
+                                    "Lambda.TooManyRequestsException",
+                                    "States.TaskFailed"
+                                ],
+                                "IntervalSeconds": 2,
+                                "MaxAttempts": 2,
+                                "BackoffRate": 2.0
+                            }
+                        ],
+                        "Catch": [
+                            {
+                                "ErrorEquals": [
+                                    "States.ALL"
+                                ],
+                                "ResultPath": "$.error",
+                                "Next": "ExecuteRollback"
+                            }
+                        ],
+                        "Next": "IsWaveComplete"
+                    },
+                    "IsWaveComplete": {
+                        "Type": "Choice",
+                        "Choices": [
+                            {
+                                "Variable": "$.status_result.is_complete",
+                                "BooleanEquals": true,
+                                "Next": "AssessWaveHealth"
+                            }
+                        ],
+                        "Default": "WaitForWaveCompletion"
+                    },
+                    "AssessWaveHealth": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "Parameters": {
+                            "FunctionName": "${LambdaFunctionArn}",
+                            "Payload": {
+                                "action": "ASSESS",
+                                "deployment_id.$": "$.deployment_id",
+                                "wave_number.$": "$.wave.wave_number",
+                                "job_id.$": "$.job_result.job_id"
+                            }
+                        },
+                        "ResultPath": "$.assess_result",
+                        "ResultSelector": {
+                            "decision.$": "$.Payload.decision",
+                            "reasoning.$": "$.Payload.reasoning",
+                            "success_rate.$": "$.Payload.success_rate",
+                            "failure_types.$": "$.Payload.failure_types",
+                            "pause_count.$": "$.Payload.pause_count"
+                        },
+                        "Retry": [
+                            {
+                                "ErrorEquals": [
+                                    "Lambda.ServiceException",
+                                    "Lambda.TooManyRequestsException",
+                                    "States.TaskFailed"
+                                ],
+                                "IntervalSeconds": 2,
+                                "MaxAttempts": 2,
+                                "BackoffRate": 2.0
+                            }
+                        ],
+                        "Catch": [
+                            {
+                                "ErrorEquals": [
+                                    "States.ALL"
+                                ],
+                                "ResultPath": "$.error",
+                                "Next": "ExecuteRollback"
+                            }
+                        ],
+                        "Next": "DecisionBranch"
+                    },
+                    "DecisionBranch": {
+                        "Type": "Choice",
+                        "Choices": [
+                            {
+                                "Variable": "$.assess_result.decision",
+                                "StringEquals": "PROCEED",
+                                "Next": "WaveSucceeded"
+                            },
+                            {
+                                "Variable": "$.assess_result.decision",
+                                "StringEquals": "PAUSE",
+                                "Next": "CheckRetryCount"
+                            },
+                            {
+                                "Variable": "$.assess_result.decision",
+                                "StringEquals": "ROLLBACK",
+                                "Next": "ExecuteRollback"
+                            }
+                        ],
+                        "Default": "ExecuteRollback"
+                    },
+                    "CheckRetryCount": {
+                        "Type": "Choice",
+                        "Choices": [
+                            {
+                                "Variable": "$.assess_result.pause_count",
+                                "NumericGreaterThanEquals": 3,
+                                "Next": "ExecuteRollback"
+                            }
+                        ],
+                        "Default": "PauseAndRetry"
+                    },
+                    "PauseAndRetry": {
+                        "Type": "Wait",
+                        "Seconds": 600,
+                        "Next": "AssessWaveHealth"
+                    },
+                    "ExecuteRollback": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "Parameters": {
+                            "FunctionName": "${LambdaFunctionArn}",
+                            "Payload": {
+                                "action": "ROLLBACK",
+                                "deployment_id.$": "$.deployment_id",
+                                "job_id.$": "States.Format('fw-deploy-{}-wave-{}', $.deployment_id, $.wave.wave_number)",
+                                "failed_thing_names.$": "$.wave.thing_names",
+                                "previous_firmware_s3_url.$": "$.firmware_s3_url"
+                            }
+                        },
+                        "ResultPath": "$.rollback_result",
+                        "ResultSelector": {
+                            "rollback_job_id.$": "$.Payload.rollback_job_id",
+                            "rollback_job_arn.$": "$.Payload.rollback_job_arn",
+                            "target_count.$": "$.Payload.target_count",
+                            "cancelled_job_id.$": "$.Payload.cancelled_job_id"
+                        },
+                        "Retry": [
+                            {
+                                "ErrorEquals": [
+                                    "Lambda.ServiceException",
+                                    "Lambda.TooManyRequestsException",
+                                    "States.TaskFailed"
+                                ],
+                                "IntervalSeconds": 2,
+                                "MaxAttempts": 2,
+                                "BackoffRate": 2.0
+                            }
+                        ],
+                        "Catch": [
+                            {
+                                "ErrorEquals": [
+                                    "States.ALL"
+                                ],
+                                "ResultPath": "$.error",
+                                "Next": "WaveFailed"
+                            }
+                        ],
+                        "Next": "WaveFailed"
+                    },
+                    "WaveSucceeded": {
+                        "Type": "Succeed"
+                    },
+                    "WaveFailed": {
+                        "Type": "Fail",
+                        "Error": "WaveRollback",
+                        "Cause": "Wave failed and rollback was executed"
+                    }
+                }
+            },
+            "ResultPath": "$.wave_results",
+            "Catch": [
+                {
+                    "ErrorEquals": [
+                        "States.ALL"
+                    ],
+                    "ResultPath": "$.error",
+                    "Next": "NotifyOperator"
+                }
+            ],
+            "Next": "NotifyOperator"
+        },
+        "NotifyOperator": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::sns:publish",
+            "Parameters": {
+                "TopicArn": "${NotificationTopicArn}",
+                "Subject": "Firmware Deployment Status",
+                "Message.$": "States.Format('Deployment {} completed. Target version: {}', $.plan_result.deployment_id, $.target_version)"
+            },
+            "ResultPath": "$.notify_result",
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.TooManyRequestsException",
+                        "States.TaskFailed"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 2.0
+                }
+            ],
+            "Catch": [
+                {
+                    "ErrorEquals": [
+                        "States.ALL"
+                    ],
+                    "ResultPath": "$.final_error",
+                    "Next": "DeploymentComplete"
+                }
+            ],
+            "Next": "DeploymentComplete"
+        },
+        "DeploymentComplete": {
+            "Type": "Succeed"
+        }
+    }
+}

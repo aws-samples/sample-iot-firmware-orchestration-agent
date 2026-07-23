@@ -1,0 +1,22 @@
+{
+  "app": ".venv/bin/python app.py",
+  "watch": {
+    "include": [
+      "**"
+    ],
+    "exclude": [
+      "README.md",
+      "cdk*.json",
+      "requirements*.txt",
+      "**/__pycache__",
+      "**/.pytest_cache",
+      "tests"
+    ]
+  },
+  "context": {
+    "bedrock_model_id": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "wave_timeout_minutes": "30",
+    "@aws-cdk/aws-lambda:recognizeLayerVersion": true,
+    "@aws-cdk/core:stackRelativeExports": true
+  }
+}

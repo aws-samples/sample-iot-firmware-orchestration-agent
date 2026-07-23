@@ -1,0 +1,5 @@
+strands-agents==1.47.0
+boto3==1.43.50
+pydantic==2.13.4
+packaging==26.2
+aws-embedded-metrics==3.5.0

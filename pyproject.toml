@@ -1,0 +1,45 @@
+[project]
+name = "sample-iot-firmware-orchestration-agent"
+version = "0.1.0"
+description = "IoT firmware update orchestration agent using Amazon Bedrock and AWS Step Functions"
+requires-python = ">=3.13"
+license = "MIT-0"
+readme = "README.md"
+
+[tool.ruff]
+target-version = "py313"
+line-length = 120
+src = ["lambda", "stacks", "scripts", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "N",    # pep8-naming
+    "D",    # pydocstyle
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+    "TCH",  # flake8-type-checking
+    "RUF",  # ruff-specific rules
+]
+ignore = [
+    "D100",   # missing docstring in public module
+    "D104",   # missing docstring in public package
+    "D203",   # one-blank-line-before-class (conflicts with D211)
+    "D213",   # multi-line-docstring-summary-second-line (conflicts with D212)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["D", "N802", "N803"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "unit: Unit tests",
+    "integration: Integration tests",
+    "e2e: End-to-end tests",
+    "property: Property-based tests",
+]
