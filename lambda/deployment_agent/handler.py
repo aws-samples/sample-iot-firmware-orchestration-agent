@@ -18,6 +18,8 @@ from aws_embedded_metrics.unit import Unit
 from deployment_agent.agent import create_agent
 from deployment_agent.tools.create_deployment_wave import create_deployment_wave
 from deployment_agent.tools.get_wave_health import get_wave_health
+from deployment_agent.tools.write_deployment_history import write_deployment_history
+from deployment_agent.tools.write_device_outcomes import write_device_outcomes
 
 # ---------------------------------------------------------------------------
 # Structured JSON logging configuration
@@ -101,10 +103,11 @@ def _log_with_context(
 
 
 def handle_plan(event: dict) -> dict:
-    """Handle the PLAN action by invoking the Strands agent.
+    """Handle the PLAN action by invoking the Strands agent and enforcing wave constraints.
 
     Constructs a natural language prompt from the event parameters, invokes the
-    agent, and parses the structured JSON response.
+    agent to determine eligible devices, then enforces deterministic wave
+    constraints via plan_waves().
 
     Args:
         event: The Lambda event containing firmware_s3_url, target_version,
@@ -115,6 +118,8 @@ def handle_plan(event: dict) -> dict:
 
     """
     import uuid
+
+    from deployment_agent.wave_planner import plan_waves
 
     firmware_s3_url = event.get("firmware_s3_url", "")
     target_version = event.get("target_version", "")
@@ -157,8 +162,40 @@ def handle_plan(event: dict) -> dict:
 
     details = parsed.get("details", parsed)
     deployment_id = f"deploy-{device_type}-{unique_suffix}"
-    wave_plan = details.get("waves", details.get("wave_plan", []))
-    total_devices = details.get("total_eligible_devices", details.get("total_devices", 0))
+
+    # Extract eligible devices from agent response for deterministic wave planning
+    eligible_devices = details.get("eligible_devices", [])
+
+    if eligible_devices:
+        # Use plan_waves() to enforce deterministic constraints:
+        # - Canary wave is LOW-risk only
+        # - Max 500 devices per wave
+        # - Proper tiered deployment strategy
+        try:
+            waves = plan_waves(eligible_devices)
+            wave_plan = [
+                {
+                    "wave_number": w.wave_number,
+                    "wave_type": w.wave_type,
+                    "thing_names": w.thing_names,
+                    "target_count": w.target_count,
+                }
+                for w in waves
+            ]
+            total_devices = sum(w.target_count for w in waves)
+        except ValueError as e:
+            _log_with_context(
+                logging.WARNING,
+                f"plan_waves() failed: {e}. Using agent-provided plan.",
+                action="PLAN",
+                deployment_id=deployment_id,
+            )
+            wave_plan = details.get("waves", details.get("wave_plan", []))
+            total_devices = details.get("total_eligible_devices", details.get("total_devices", 0))
+    else:
+        # Fallback to agent-provided plan if eligible_devices not structured
+        wave_plan = details.get("waves", details.get("wave_plan", []))
+        total_devices = details.get("total_eligible_devices", details.get("total_devices", 0))
 
     _log_with_context(
         logging.INFO,
@@ -194,6 +231,8 @@ def handle_assess(event: dict) -> dict:
     deployment_id = event.get("deployment_id", "")
     wave_number = event.get("wave_number", 0)
     job_id = event.get("job_id", "")
+    thing_names = event.get("thing_names", [])
+    target_version = event.get("target_version", "")
 
     _log_with_context(
         logging.INFO,
@@ -231,7 +270,7 @@ def handle_assess(event: dict) -> dict:
     reasoning = parsed.get("reasoning", details.get("reasoning", ""))
     success_rate = details.get("success_rate", 0.0)
     failure_types = details.get("failure_types", {})
-    pause_count = details.get("pause_count", 0)
+    failed_thing_names = details.get("failed_thing_names", [])
 
     _log_with_context(
         logging.INFO,
@@ -243,24 +282,52 @@ def handle_assess(event: dict) -> dict:
         outcome=decision,
     )
 
+    # Record agent decision to DeploymentHistory for audit trail
+    try:
+        write_deployment_history(
+            deployment_id=deployment_id,
+            wave_number=wave_number,
+            action="ASSESS",
+            decision=decision,
+            reasoning=reasoning,
+            success_rate=success_rate,
+            failure_types=failure_types,
+            thing_names=failed_thing_names,
+        )
+    except Exception:
+        logger.warning("Failed to write deployment history", exc_info=True)
+
+    # Write per-device outcomes when wave completes (PROCEED or ROLLBACK)
+    if decision == "PROCEED" and thing_names:
+        try:
+            write_device_outcomes(
+                thing_names=thing_names,
+                failed_thing_names=failed_thing_names,
+                target_version=target_version,
+                deployment_id=deployment_id,
+            )
+        except Exception:
+            logger.warning("Failed to write device outcomes", exc_info=True)
+
     return {
         "decision": decision,
         "reasoning": reasoning,
         "success_rate": success_rate,
         "failure_types": failure_types,
-        "pause_count": pause_count,
+        "failed_thing_names": failed_thing_names,
     }
 
 
 def handle_rollback(event: dict) -> dict:
-    """Handle the ROLLBACK action by invoking the Strands agent.
+    """Handle the ROLLBACK action by resolving previous firmware and invoking rollback.
 
-    Constructs a natural language prompt from the event parameters, invokes the
-    agent to execute the rollback, and parses the structured JSON response.
+    Queries FleetInventory to determine each failed device's current firmware
+    version, constructs the correct previous firmware S3 URL per device, and
+    invokes the agent to execute the rollback.
 
     Args:
         event: The Lambda event containing deployment_id, job_id,
-            failed_thing_names, and previous_firmware_s3_url.
+            failed_thing_names, device_type, and firmware_s3_url.
 
     Returns:
         A dictionary with rollback_job_id, rollback_job_arn, target_count,
@@ -270,7 +337,8 @@ def handle_rollback(event: dict) -> dict:
     deployment_id = event.get("deployment_id", "")
     job_id = event.get("job_id", "")
     failed_thing_names = event.get("failed_thing_names", [])
-    previous_firmware_s3_url = event.get("previous_firmware_s3_url", "")
+    device_type = event.get("device_type", "")
+    firmware_s3_url = event.get("firmware_s3_url", "")
 
     _log_with_context(
         logging.INFO,
@@ -279,12 +347,31 @@ def handle_rollback(event: dict) -> dict:
         deployment_id=deployment_id,
     )
 
+    # Resolve previous firmware URL per device from FleetInventory
+    # Each failed device may have a different starting firmware version
+    previous_firmware_urls = _resolve_previous_firmware(
+        failed_thing_names=failed_thing_names,
+        firmware_s3_url=firmware_s3_url,
+        device_type=device_type,
+    )
+
+    # For the agent prompt, use the most common previous firmware URL
+    # (most devices in a wave typically share the same starting version)
+    if previous_firmware_urls:
+        # Find the most common URL
+        from collections import Counter
+
+        url_counts = Counter(previous_firmware_urls.values())
+        most_common_url = url_counts.most_common(1)[0][0]
+    else:
+        most_common_url = firmware_s3_url  # Fallback (should not happen)
+
     prompt = (
         f"Execute rollback with action=ROLLBACK. "
         f"Deployment ID: {deployment_id}. "
         f"Current Job ID: {job_id}. "
         f"Failed device names: {json.dumps(failed_thing_names)}. "
-        f"Previous firmware S3 URL: {previous_firmware_s3_url}. "
+        f"Previous firmware S3 URL: {most_common_url}. "
         f"Cancel the current job and create a rollback job for failed devices."
     )
 
@@ -322,6 +409,86 @@ def handle_rollback(event: dict) -> dict:
     )
 
     return rollback_result
+
+
+def _resolve_previous_firmware(
+    failed_thing_names: list[str],
+    firmware_s3_url: str,
+    device_type: str,
+) -> dict[str, str]:
+    """Resolve the previous firmware S3 URL for each failed device.
+
+    Queries FleetInventory for each device's current firmware_version and
+    constructs the S3 URL using the firmware naming convention.
+
+    Args:
+        failed_thing_names: List of device thing names that failed.
+        firmware_s3_url: The new firmware S3 URL (used to derive bucket/prefix).
+        device_type: The device type string for constructing rollback URLs.
+
+    Returns:
+        Dictionary mapping thing_name to its previous firmware S3 URL.
+
+    """
+    import os
+
+    import boto3
+
+    if not failed_thing_names:
+        return {}
+
+    # Extract bucket from firmware_s3_url (s3://bucket/firmware/device-vX.Y.Z.bin)
+    # Parse the bucket name from the URL
+    if firmware_s3_url.startswith("s3://"):
+        url_parts = firmware_s3_url[5:].split("/", 1)
+        bucket = url_parts[0]
+    else:
+        bucket = os.environ.get("FIRMWARE_BUCKET", "")
+
+    dynamodb = boto3.resource("dynamodb")
+    table_name = os.environ.get("FLEET_INVENTORY_TABLE", "FleetInventory")
+    table = dynamodb.Table(table_name)
+
+    previous_urls: dict[str, str] = {}
+
+    # BatchGetItem for efficiency (up to 100 items per call)
+    for i in range(0, len(failed_thing_names), 100):
+        batch = failed_thing_names[i : i + 100]
+        keys = [{"thing_name": name} for name in batch]
+
+        response = dynamodb.meta.client.batch_get_item(
+            RequestItems={
+                table_name: {
+                    "Keys": keys,
+                    "ProjectionExpression": "thing_name, firmware_version",
+                }
+            }
+        )
+
+        for item in response.get("Responses", {}).get(table_name, []):
+            thing_name = item["thing_name"]
+            firmware_version = item.get("firmware_version", "")
+            if firmware_version and device_type:
+                # Construct S3 URL following naming convention
+                previous_urls[thing_name] = (
+                    f"s3://{bucket}/firmware/{device_type}-v{firmware_version}.bin"
+                )
+
+        # Handle unprocessed keys (retry)
+        unprocessed = response.get("UnprocessedKeys", {}).get(table_name)
+        if unprocessed:
+            retry_response = dynamodb.meta.client.batch_get_item(
+                RequestItems={table_name: unprocessed}
+            )
+            for item in retry_response.get("Responses", {}).get(table_name, []):
+                thing_name = item["thing_name"]
+                firmware_version = item.get("firmware_version", "")
+                if firmware_version and device_type:
+                    previous_urls[thing_name] = (
+                        f"s3://{bucket}/firmware/{device_type}-v{firmware_version}.bin"
+                    )
+
+    return previous_urls
 
 
 def handle_create_wave(event: dict) -> dict:

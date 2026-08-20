@@ -8,6 +8,7 @@ from botocore.exceptions import ClientError
 from strands import tool
 
 from shared.constants import WAVE_TIMEOUT_MINUTES
+from shared.job_id import build_job_id
 
 logger = logging.getLogger(__name__)
 
@@ -77,26 +78,36 @@ def rollback_wave(
     sts_client = boto3.client("sts")
     account_id = sts_client.get_caller_identity()["Account"]
 
-    # --- Generate rollback job ID ---
+    # --- Generate rollback job ID using shared helper ---
     rollback_job_id = f"rollback-{job_id}"
 
     # --- Build thing ARN targets ---
     targets = [f"arn:aws:iot:{region}:{account_id}:thing/{name}" for name in failed_thing_names]
 
-    # --- Create rollback IoT Job ---
+    # --- Create rollback IoT Job (handle ResourceAlreadyExistsException for retry idempotency) ---
     job_document = json.dumps({"firmware_url": previous_firmware_s3_url, "rollback": True})
 
-    response = iot_client.create_job(
-        jobId=rollback_job_id,
-        targets=targets,
-        document=job_document,
-        targetSelection="SNAPSHOT",
-        timeoutConfig={"inProgressTimeoutInMinutes": WAVE_TIMEOUT_MINUTES},
-    )
+    try:
+        response = iot_client.create_job(
+            jobId=rollback_job_id,
+            targets=targets,
+            document=job_document,
+            targetSelection="SNAPSHOT",
+            timeoutConfig={"inProgressTimeoutInMinutes": WAVE_TIMEOUT_MINUTES},
+        )
+        rollback_job_arn = response["jobArn"]
+    except iot_client.exceptions.ResourceAlreadyExistsException:
+        # Retry scenario: rollback job already exists. Describe and return existing.
+        logger.warning(
+            "Rollback job %s already exists (retry scenario). Using existing job.",
+            rollback_job_id,
+        )
+        describe_response = iot_client.describe_job(jobId=rollback_job_id)
+        rollback_job_arn = describe_response["job"]["jobArn"]
 
     return {
         "rollback_job_id": rollback_job_id,
-        "rollback_job_arn": response["jobArn"],
+        "rollback_job_arn": rollback_job_arn,
         "target_count": len(failed_thing_names),
         "cancelled_job_id": job_id,
     }

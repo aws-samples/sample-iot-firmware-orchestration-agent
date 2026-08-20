@@ -1,11 +1,17 @@
 """Tool to retrieve device risk profile with production window computation."""
 
+import logging
 import os
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import boto3
+from pydantic import ValidationError
 from strands import tool
+
+from deployment_agent.models.device import Device
+
+logger = logging.getLogger(__name__)
 
 
 def _is_in_production_window(production_schedule: dict | None) -> bool:
@@ -79,14 +85,37 @@ def get_device_risk_profile(thing_name: str) -> dict:
     if item is None:
         raise ValueError(f"Device '{thing_name}' not found in Fleet Inventory")
 
-    production_schedule = item.get("production_schedule")
-    in_production = _is_in_production_window(production_schedule)
+    # Validate through Device model
+    try:
+        device = Device.model_validate(item)
+    except ValidationError as e:
+        logger.warning(
+            "Device record validation failed for %s: %s. Using raw item.",
+            thing_name,
+            str(e),
+        )
+        # Fallback to raw item access for partially valid records
+        production_schedule = item.get("production_schedule")
+        in_production = _is_in_production_window(production_schedule)
+        return {
+            "thing_name": item.get("thing_name", thing_name),
+            "criticality": item.get("criticality", "MEDIUM"),
+            "production_schedule": production_schedule,
+            "last_update_result": item.get("last_update_result"),
+            "hardware_revision": item.get("hardware_revision", "unknown"),
+            "is_in_production_window": in_production,
+        }
+
+    production_schedule_dict = (
+        device.production_schedule.model_dump() if device.production_schedule else None
+    )
+    in_production = _is_in_production_window(production_schedule_dict)
 
     return {
-        "thing_name": item["thing_name"],
-        "criticality": item["criticality"],
-        "production_schedule": production_schedule,
-        "last_update_result": item.get("last_update_result"),
-        "hardware_revision": item["hardware_revision"],
+        "thing_name": device.thing_name,
+        "criticality": device.criticality.value,
+        "production_schedule": production_schedule_dict,
+        "last_update_result": device.last_update_result.value if device.last_update_result else None,
+        "hardware_revision": device.hardware_revision,
         "is_in_production_window": in_production,
     }

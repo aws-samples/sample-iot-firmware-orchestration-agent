@@ -65,7 +65,7 @@ class FirmwareAgentStack(Stack):
             removal_policy=RemovalPolicy.DESTROY,
         )
 
-        # GSI-1: device_type-index
+        # GSI: device_type-index for querying devices by type
         table.add_global_secondary_index(
             index_name="device_type-index",
             partition_key=dynamodb.Attribute(name="device_type", type=dynamodb.AttributeType.STRING),
@@ -73,13 +73,9 @@ class FirmwareAgentStack(Stack):
             projection_type=dynamodb.ProjectionType.ALL,
         )
 
-        # GSI-2: facility-index
-        table.add_global_secondary_index(
-            index_name="facility-index",
-            partition_key=dynamodb.Attribute(name="facility", type=dynamodb.AttributeType.STRING),
-            sort_key=dynamodb.Attribute(name="thing_name", type=dynamodb.AttributeType.STRING),
-            projection_type=dynamodb.ProjectionType.ALL,
-        )
+        # Note: This sample uses SNAPSHOT targeting (explicit device ARN enumeration)
+        # with a ceiling of 500 devices per wave due to IoT Jobs target list limits.
+        # Production deployments should use Dynamic Thing Groups for larger fleets.
 
         return table
 
@@ -175,7 +171,6 @@ class FirmwareAgentStack(Stack):
                 resources=[
                     f"arn:aws:iot:{self.region}:{self.account}:job/*",
                     f"arn:aws:iot:{self.region}:{self.account}:thing/*",
-                    f"arn:aws:iot:{self.region}:{self.account}:thinggroup/*",
                 ],
             )
         )
@@ -189,14 +184,16 @@ class FirmwareAgentStack(Stack):
             )
         )
 
-        # DynamoDB permissions: Query, GetItem, PutItem on tables and indexes
+        # DynamoDB permissions: Query, GetItem, BatchGetItem, PutItem, BatchWriteItem on tables and indexes
         agent_function.add_to_role_policy(
             iam.PolicyStatement(
                 effect=iam.Effect.ALLOW,
                 actions=[
                     "dynamodb:Query",
                     "dynamodb:GetItem",
+                    "dynamodb:BatchGetItem",
                     "dynamodb:PutItem",
+                    "dynamodb:BatchWriteItem",
                 ],
                 resources=[
                     self.fleet_inventory_table.table_arn,
@@ -294,7 +291,35 @@ class FirmwareAgentStack(Stack):
         return state_machine
 
     def _create_eventbridge_rule(self) -> events.Rule:
-        """Create EventBridge rule for firmware upload events."""
+        """Create EventBridge rule for firmware upload events.
+
+        Uses a parser Lambda to transform S3 Object Created events into valid
+        state machine input. The parser extracts device_type and target_version
+        from the firmware filename convention: firmware/{device_type}-v{version}.bin
+        """
+        # Create the event parser Lambda function
+        parser_function = lambda_.Function(
+            self,
+            "EventParserFunction",
+            runtime=lambda_.Runtime.PYTHON_3_13,
+            handler="event_parser.handler.handler",
+            code=lambda_.Code.from_asset(".build/lambda"),
+            timeout=Duration.seconds(30),
+            memory_size=128,
+            environment={
+                "STATE_MACHINE_ARN": self.state_machine.attr_arn,
+            },
+        )
+
+        # Grant parser Lambda permission to start state machine executions
+        parser_function.add_to_role_policy(
+            iam.PolicyStatement(
+                effect=iam.Effect.ALLOW,
+                actions=["states:StartExecution"],
+                resources=[self.state_machine.attr_arn],
+            )
+        )
+
         # Create the rule targeting S3 Object Created events for firmware/ prefix
         rule = events.Rule(
             self,
@@ -309,26 +334,8 @@ class FirmwareAgentStack(Stack):
             ),
         )
 
-        # Target: Step Functions state machine with input transformation
-        # Parse device_type and target_version from filename pattern:
-        # firmware/{device_type}-v{version}.bin
-        rule.add_target(
-            targets.SfnStateMachine(
-                sfn.StateMachine.from_state_machine_arn(
-                    self,
-                    "ImportedStateMachine",
-                    state_machine_arn=self.state_machine.attr_arn,
-                ),
-                input=events.RuleTargetInput.from_object(
-                    {
-                        "firmware_s3_url": events.EventField.from_path("$.detail.bucket.name"),
-                        "s3_key": events.EventField.from_path("$.detail.object.key"),
-                        "device_type": events.EventField.from_path("$.detail.object.key"),
-                        "target_version": events.EventField.from_path("$.detail.object.key"),
-                    }
-                ),
-            )
-        )
+        # Target: Parser Lambda that validates and transforms S3 event input
+        rule.add_target(targets.LambdaFunction(parser_function))
 
         return rule
 

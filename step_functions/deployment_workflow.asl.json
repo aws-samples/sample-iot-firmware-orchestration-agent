@@ -86,7 +86,9 @@
                 "wave_index.$": "$$.Map.Item.Index",
                 "deployment_id.$": "$.plan_result.deployment_id",
                 "firmware_s3_url.$": "$.firmware_s3_url",
-                "target_version.$": "$.target_version"
+                "target_version.$": "$.target_version",
+                "device_type.$": "$.device_type",
+                "pause_count": 0
             },
             "Iterator": {
                 "StartAt": "CreateIoTJob",
@@ -129,7 +131,7 @@
                                     "States.ALL"
                                 ],
                                 "ResultPath": "$.error",
-                                "Next": "ExecuteRollback"
+                                "Next": "FallbackRollback"
                             }
                         ],
                         "Next": "WaitForWaveCompletion"
@@ -172,7 +174,7 @@
                                     "States.ALL"
                                 ],
                                 "ResultPath": "$.error",
-                                "Next": "ExecuteRollback"
+                                "Next": "FallbackRollback"
                             }
                         ],
                         "Next": "IsWaveComplete"
@@ -197,7 +199,9 @@
                                 "action": "ASSESS",
                                 "deployment_id.$": "$.deployment_id",
                                 "wave_number.$": "$.wave.wave_number",
-                                "job_id.$": "$.job_result.job_id"
+                                "job_id.$": "$.job_result.job_id",
+                                "thing_names.$": "$.wave.thing_names",
+                                "target_version.$": "$.target_version"
                             }
                         },
                         "ResultPath": "$.assess_result",
@@ -206,7 +210,7 @@
                             "reasoning.$": "$.Payload.reasoning",
                             "success_rate.$": "$.Payload.success_rate",
                             "failure_types.$": "$.Payload.failure_types",
-                            "pause_count.$": "$.Payload.pause_count"
+                            "failed_thing_names.$": "$.Payload.failed_thing_names"
                         },
                         "Retry": [
                             {
@@ -226,7 +230,7 @@
                                     "States.ALL"
                                 ],
                                 "ResultPath": "$.error",
-                                "Next": "ExecuteRollback"
+                                "Next": "FallbackRollback"
                             }
                         ],
                         "Next": "DecisionBranch"
@@ -242,7 +246,7 @@
                             {
                                 "Variable": "$.assess_result.decision",
                                 "StringEquals": "PAUSE",
-                                "Next": "CheckRetryCount"
+                                "Next": "IncrementPauseCount"
                             },
                             {
                                 "Variable": "$.assess_result.decision",
@@ -252,11 +256,27 @@
                         ],
                         "Default": "ExecuteRollback"
                     },
+                    "IncrementPauseCount": {
+                        "Comment": "Increment state-machine-owned pause counter (MAX_PAUSE_RETRIES = 3)",
+                        "Type": "Pass",
+                        "Parameters": {
+                            "wave.$": "$.wave",
+                            "wave_index.$": "$.wave_index",
+                            "deployment_id.$": "$.deployment_id",
+                            "firmware_s3_url.$": "$.firmware_s3_url",
+                            "target_version.$": "$.target_version",
+                            "device_type.$": "$.device_type",
+                            "job_result.$": "$.job_result",
+                            "assess_result.$": "$.assess_result",
+                            "pause_count.$": "States.MathAdd($.pause_count, 1)"
+                        },
+                        "Next": "CheckRetryCount"
+                    },
                     "CheckRetryCount": {
                         "Type": "Choice",
                         "Choices": [
                             {
-                                "Variable": "$.assess_result.pause_count",
+                                "Variable": "$.pause_count",
                                 "NumericGreaterThanEquals": 3,
                                 "Next": "ExecuteRollback"
                             }
@@ -276,9 +296,55 @@
                             "Payload": {
                                 "action": "ROLLBACK",
                                 "deployment_id.$": "$.deployment_id",
-                                "job_id.$": "States.Format('fw-deploy-{}-wave-{}', $.deployment_id, $.wave.wave_number)",
+                                "job_id.$": "$.job_result.job_id",
+                                "failed_thing_names.$": "$.assess_result.failed_thing_names",
+                                "device_type.$": "$.device_type",
+                                "firmware_s3_url.$": "$.firmware_s3_url"
+                            }
+                        },
+                        "ResultPath": "$.rollback_result",
+                        "ResultSelector": {
+                            "rollback_job_id.$": "$.Payload.rollback_job_id",
+                            "rollback_job_arn.$": "$.Payload.rollback_job_arn",
+                            "target_count.$": "$.Payload.target_count",
+                            "cancelled_job_id.$": "$.Payload.cancelled_job_id"
+                        },
+                        "Retry": [
+                            {
+                                "ErrorEquals": [
+                                    "Lambda.ServiceException",
+                                    "Lambda.TooManyRequestsException",
+                                    "States.TaskFailed"
+                                ],
+                                "IntervalSeconds": 2,
+                                "MaxAttempts": 2,
+                                "BackoffRate": 2.0
+                            }
+                        ],
+                        "Catch": [
+                            {
+                                "ErrorEquals": [
+                                    "States.ALL"
+                                ],
+                                "ResultPath": "$.error",
+                                "Next": "WaveFailed"
+                            }
+                        ],
+                        "Next": "WaveFailed"
+                    },
+                    "FallbackRollback": {
+                        "Comment": "Fallback rollback when assessment fails - targets full wave list as safety net",
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "Parameters": {
+                            "FunctionName": "${LambdaFunctionArn}",
+                            "Payload": {
+                                "action": "ROLLBACK",
+                                "deployment_id.$": "$.deployment_id",
+                                "job_id.$": "$.job_result.job_id",
                                 "failed_thing_names.$": "$.wave.thing_names",
-                                "previous_firmware_s3_url.$": "$.firmware_s3_url"
+                                "device_type.$": "$.device_type",
+                                "firmware_s3_url.$": "$.firmware_s3_url"
                             }
                         },
                         "ResultPath": "$.rollback_result",

@@ -6,6 +6,7 @@ import boto3
 from strands import tool
 
 from shared.constants import MAX_WAVE_BATCH_SIZE
+from shared.job_id import build_job_id
 
 
 @tool
@@ -69,9 +70,8 @@ def create_deployment_wave(
     sts_client = boto3.client("sts")
     account_id = sts_client.get_caller_identity()["Account"]
 
-    # --- Generate job ID (IoT job IDs only allow [a-zA-Z0-9_-]) ---
-    sanitized_id = deployment_id.replace(".", "-")
-    job_id = f"fw-deploy-{sanitized_id}-wave-{wave_number}"
+    # --- Generate job ID using shared helper (IoT job IDs only allow [a-zA-Z0-9_-]) ---
+    job_id = build_job_id(deployment_id, wave_number)
 
     # --- Build thing ARN targets ---
     targets = [f"arn:aws:iot:{region}:{account_id}:thing/{name}" for name in thing_names]

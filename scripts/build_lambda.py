@@ -28,7 +28,7 @@ def main() -> None:
     BUILD_DIR.mkdir(parents=True)
 
     # Copy source code
-    for item in ("deployment_agent", "shared"):
+    for item in ("deployment_agent", "shared", "event_parser"):
         src = LAMBDA_SRC / item
         dst = BUILD_DIR / item
         if src.exists():

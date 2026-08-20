@@ -45,8 +45,8 @@ The following diagram shows the AI-driven firmware update orchestration architec
 
 ### Health assessment
 
-7. After each wave completes, the deployment agent queries AWS IoT Core for device shadows and telemetry to assess fleet health: success count, failure count, and failure types (connectivity-lost, boot-loop, version-mismatch).
-8. The agent uses Amazon Bedrock to reason over the health data and decide: proceed to next wave, pause for investigation, or rollback the current wave.
+7. After each wave completes, the deployment agent queries AWS IoT Jobs execution statuses for each device in the wave. It classifies failures into categories (connectivity-lost, boot-loop, version-mismatch, timeout) by inspecting the `detailsMap` field of failed executions for keyword indicators (for example, "restart" maps to boot-loop, "disconnect" maps to connectivity-lost).
+8. The agent uses Amazon Bedrock to reason over the health data, including per-device failure details and hardware revision correlation, then decides: proceed to next wave, pause for investigation, or rollback the current wave.
 
 ### Rollback
 
@@ -65,8 +65,8 @@ The following diagram shows the AI-driven firmware update orchestration architec
 Clone the repository and install dependencies:
 
 ```bash
-git clone https://github.com/aws-samples/sample-iot-firmware-agent.git
-cd sample-iot-firmware-agent
+git clone https://github.com/aws-samples/sample-iot-firmware-orchestration-agent.git
+cd sample-iot-firmware-orchestration-agent
 
 python3.13 -m venv .venv
 source .venv/bin/activate
@@ -209,8 +209,11 @@ sample-iot-firmware-orchestration-agent/
 │   │   ├── wave_planner.py             # Wave planning logic
 │   │   ├── tools/                      # Agent tool implementations
 │   │   └── models/                     # Pydantic data models
+│   ├── event_parser/
+│   │   └── handler.py                  # EventBridge S3 event parser
 │   └── shared/
-│       └── constants.py                # Configuration and thresholds
+│       ├── constants.py                # Configuration and thresholds
+│       └── job_id.py                   # Shared job ID construction helper
 ├── step_functions/
 │   └── deployment_workflow.asl.json    # Step Functions state machine
 ├── scripts/
@@ -223,10 +226,24 @@ sample-iot-firmware-orchestration-agent/
 │   ├── integration/                    # Step Functions flow + decision tests
 │   └── e2e/                            # Full deployed stack tests
 ├── docs/
-│   ├── architecture.md
 │   └── image/
 └── LICENSE                             # MIT-0
 ```
+
+## Limitations and production considerations
+
+This sample uses explicit device ARN enumeration (SNAPSHOT targeting) with a ceiling of 500 devices per wave due to the AWS IoT Jobs target list size limit. Production deployments should use [Dynamic Thing Groups](https://docs.aws.amazon.com/iot/latest/developerguide/dynamic-thing-groups.html) for targeting larger fleets without enumerating individual device ARNs.
+
+Additional considerations for production use:
+
+- **Firmware filename convention**: The EventBridge auto-trigger requires firmware binaries to follow the naming convention `firmware/{device_type}-v{version}.bin` (for example, `firmware/sensor-v1.2.3.bin`). Custom naming requires updating the event parser Lambda.
+- **Failure classification**: Health assessment classifies failures by inspecting the `detailsMap` keyword matching in IoT Job execution status reports. The accuracy of classification depends on devices reporting meaningful status details.
+- **Deployment history**: Every agent decision (PROCEED, PAUSE, ROLLBACK) is recorded in the DeploymentHistory DynamoDB table, enabling post-incident review.
+- **Device outcome tracking**: Per-device update results are written back to FleetInventory, enabling canary wave ordering by prior update success in subsequent deployments.
+
+For related patterns at larger scale, see:
+- [Design IoT Jobs for rapid large-scale device updates](https://aws.amazon.com/blogs/iot/design-iot-jobs-for-rapid-large-scale-device-updates-with-advanced-device-group-target-patterns/)
+- [Using dynamic thing groups to continuously update software](https://aws.amazon.com/blogs/iot/using-dynamic-thing-groups-to-continuously-update-software-on-devices/)
 
 ## References
 
